@@ -31,21 +31,7 @@ jobs:
         id: ver
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          VERSION="$(tr -d '[:space:]' < VERSION)"
-          VERSION="${VERSION#v}"
-          [ -n "$VERSION" ] || { echo "VERSION is empty"; exit 1; }
-          TAG="v$VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "release $TAG already exists"
-          else
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "no release for $TAG; will build"
-          fi
+        run: scripts/resolve-version.sh
 
   build:
     name: build ${{ matrix.termux }}
@@ -76,60 +62,29 @@ jobs:
             go386: sse2
             triple: i686-linux-android
     steps:
-      - name: Download upstream source
-        env:
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          mkdir src
-          curl -fsSL "https://github.com/$UPSTREAM/archive/refs/tags/${TAG}.tar.gz" \
-            | tar -xz --strip-components=1 -C src
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod
-          cache: true
-          cache-dependency-path: src/go.sum
-
-      - name: Set up Android NDK
-        run: |
-          set -eu
-          NDK="${ANDROID_NDK_LATEST_HOME:-$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | tail -n 1)}"
-          [ -d "$NDK" ] || { echo "Android NDK not found on runner"; exit 1; }
-          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "CC=${BIN}/${{ matrix.triple }}24-clang" >> "$GITHUB_ENV"
+          go-version: "1.25"
+          cache: false
 
       - name: Build
-        working-directory: src
         env:
-          CGO_ENABLED: "1"
-          GOOS: android
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TERMUX: ${{ matrix.termux }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           GO386: ${{ matrix.go386 }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          set -eu
-          mkdir -p "$GITHUB_WORKSPACE/stage"
-          go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
-            -o "$GITHUB_WORKSPACE/stage/ttt" ./cmd/ttt
-          cp LICENSE "$GITHUB_WORKSPACE/stage/"
-
-      - name: Package
-        env:
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -eu
-          NAME="ttt-${VERSION}-${{ matrix.termux }}"
-          tar -czf "$NAME.tar.gz" -C "$GITHUB_WORKSPACE/stage" ttt LICENSE
-          sha256sum "$NAME.tar.gz" > "sha256sums.${{ matrix.termux }}"
+          TRIPLE: ${{ matrix.triple }}
+        run: scripts/build.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.termux }}
           path: |
-            *.tar.gz
-            sha256sums.*
+            dist/*.tar.gz
+            dist/sha256sums.*
           if-no-files-found: error
 
   release:
