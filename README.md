@@ -75,7 +75,7 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-BASE="https://github.com/termuxvoid/termux-ttt/releases/download/v${VERSION}"
+BASE="https://github.com/termuxvoid/ttt-termux/releases/download/v${VERSION}"
 TGZ="ttt-${VERSION}-${ARCH}.tar.gz"
 
 curl -fsSLO "$BASE/$TGZ"
