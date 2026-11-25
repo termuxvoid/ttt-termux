@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: eugenioenko/ttt
+
+jobs:
+  resolve:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      should_release: ${{ steps.ver.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          VERSION="${VERSION#v}"
+          [ -n "$VERSION" ] || { echo "VERSION is empty"; exit 1; }
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "release $TAG already exists"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "no release for $TAG; will build"
+          fi
+
+  build:
+    name: build ${{ matrix.termux }}
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Termux aarch64
+          - termux: aarch64
+            goarch: arm64
+            triple: aarch64-linux-android
+          # Termux 32-bit ARM (go requires GOARM=7 for Android)
+          - termux: arm
+            goarch: arm
+            goarm: "7"
+            triple: armv7a-linux-androideabi
+          # Termux x86_64
+          - termux: x86_64
+            goarch: amd64
+            triple: x86_64-linux-android
+          # Termux i686 (go requires GO386=sse2 for Android)
+          - termux: i686
+            goarch: "386"
+            go386: sse2
+            triple: i686-linux-android
+    steps:
+      - name: Download upstream source
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir src
+          curl -fsSL "https://github.com/$UPSTREAM/archive/refs/tags/${TAG}.tar.gz" \
+            | tar -xz --strip-components=1 -C src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: Set up Android NDK
+        run: |
+          set -eu
+          NDK="${ANDROID_NDK_LATEST_HOME:-$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | tail -n 1)}"
+          [ -d "$NDK" ] || { echo "Android NDK not found on runner"; exit 1; }
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC=${BIN}/${{ matrix.triple }}24-clang" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: src
+        env:
+          CGO_ENABLED: "1"
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GO386: ${{ matrix.go386 }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -eu
+          mkdir -p "$GITHUB_WORKSPACE/stage"
+          go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
+            -o "$GITHUB_WORKSPACE/stage/ttt" ./cmd/ttt
+          cp LICENSE "$GITHUB_WORKSPACE/stage/"
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -eu
+          NAME="ttt-${VERSION}-${{ matrix.termux }}"
+          tar -czf "$NAME.tar.gz" -C "$GITHUB_WORKSPACE/stage" ttt LICENSE
+          sha256sum "$NAME.tar.gz" > "sha256sums.${{ matrix.termux }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.termux }}
+          path: |
+            *.tar.gz
+            sha256sums.*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [resolve, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Merge checksums
+        working-directory: dist
+        run: |
+          set -eu
+          cat sha256sums.* | sort -k2 > SHA256SUMS
+          rm sha256sums.*
+          cat SHA256SUMS
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: TTT ${{ needs.resolve.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.resolve.outputs.version, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
